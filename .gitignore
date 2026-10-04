@@ -1,0 +1,8 @@
+﻿venv/
+.env
+__pycache__/
+received_images/
+test_images/
+*.pyc
+*.jpg
+*.jpeg

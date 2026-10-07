@@ -3,7 +3,7 @@ import json
 import time
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from google import genai
 from google.genai import types
 
@@ -21,7 +21,7 @@ if not GEMINI_API_KEY:
 
 
 # ============================================================
-# GEMINI CONFIGURATION
+# GEMINI
 # ============================================================
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -37,22 +37,20 @@ client = genai.Client(
 
 app = FastAPI(
     title="AI Smart Cap API",
-    description="Vision backend for AI Smart Cap",
-    version="1.0.0"
+    version="1.0"
 )
 
 
 # ============================================================
-# HOME
+# ROOT
 # ============================================================
 
 @app.get("/")
-def root():
+async def root():
 
     return {
         "success": True,
-        "message": "AI Smart Cap backend is running",
-        "model": MODEL_NAME
+        "message": "AI Smart Cap backend is running"
     }
 
 
@@ -61,11 +59,24 @@ def root():
 # ============================================================
 
 @app.get("/health")
-def health():
+async def health():
 
     return {
-        "status": "healthy",
-        "model": MODEL_NAME
+        "success": True,
+        "status": "healthy"
+    }
+
+
+# ============================================================
+# PING TEST
+# ============================================================
+
+@app.get("/ping")
+async def ping():
+
+    return {
+        "success": True,
+        "message": "pong"
     }
 
 
@@ -78,32 +89,22 @@ async def upload_image(
     file: UploadFile = File(...)
 ):
 
-    total_start = time.perf_counter()
+    server_start = time.perf_counter()
 
 
     # ========================================================
     # READ IMAGE
     # ========================================================
 
-    image_start = time.perf_counter()
+    image_read_start = time.perf_counter()
 
     image_bytes = await file.read()
 
-    image_end = time.perf_counter()
+    image_read_end = time.perf_counter()
 
-    image_read_time = image_end - image_start
-
-
-    # ========================================================
-    # VALIDATE IMAGE
-    # ========================================================
-
-    if not image_bytes:
-
-        return {
-            "success": False,
-            "error": "Empty image received"
-        }
+    image_read_seconds = (
+        image_read_end - image_read_start
+    )
 
 
     # ========================================================
@@ -116,30 +117,27 @@ for a visually impaired user.
 
 Analyze the supplied image.
 
-Identify only important information that would be useful to the user:
+Identify:
 
 1. Whether a person is present.
 2. Important everyday objects.
-3. Indian currency notes if clearly visible.
-4. Approximate position of important objects:
+3. Approximate position of objects:
    - left
    - center
    - right
+4. Indian currency notes if clearly visible.
+5. A short description suitable for spoken audio.
 
-Do NOT identify or name people.
+Rules:
 
-Do NOT guess objects.
+- Do not identify people.
+- Do not guess or invent objects.
+- Only report objects that are reasonably visible.
+- If currency denomination is unclear, return unknown.
+- Keep the summary short.
+- Return ONLY valid JSON.
 
-If something is unclear, do not invent it.
-
-For Indian currency:
-- Only report a denomination when it is clearly visible.
-- Otherwise return "unknown".
-
-Keep the response concise because it will eventually be converted
-into spoken audio.
-
-Return ONLY valid JSON in exactly this structure:
+Use exactly this structure:
 
 {
   "person_present": true,
@@ -157,130 +155,96 @@ Return ONLY valid JSON in exactly this structure:
   },
   "summary": "A person is present. A chair is on the left."
 }
-
-Confidence must be a number between 0 and 1.
 """
 
 
     # ========================================================
-    # GEMINI REQUEST
+    # GEMINI
     # ========================================================
 
     gemini_start = time.perf_counter()
 
-    try:
+    response = client.models.generate_content(
 
-        response = client.models.generate_content(
+        model=MODEL_NAME,
 
-            model=MODEL_NAME,
+        contents=[
+            prompt,
 
-            contents=[
-                prompt,
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg"
+            )
+        ],
 
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg"
-                )
-            ],
+        config=types.GenerateContentConfig(
 
-            config=types.GenerateContentConfig(
-
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                )
+            thinking_config=types.ThinkingConfig(
+                thinking_level="minimal"
             )
         )
-
-    except Exception as e:
-
-        gemini_end = time.perf_counter()
-
-        gemini_time = gemini_end - gemini_start
-
-        total_end = time.perf_counter()
-
-        total_time = total_end - total_start
-
-        return {
-            "success": False,
-            "error": str(e),
-            "latency": {
-                "image_read_seconds": round(
-                    image_read_time,
-                    4
-                ),
-                "gemini_seconds": round(
-                    gemini_time,
-                    4
-                ),
-                "server_total_seconds": round(
-                    total_time,
-                    4
-                )
-            }
-        }
-
+    )
 
     gemini_end = time.perf_counter()
 
-    gemini_time = gemini_end - gemini_start
+    gemini_seconds = (
+        gemini_end - gemini_start
+    )
 
 
     # ========================================================
-    # GET GEMINI TEXT
+    # PARSE GEMINI RESPONSE
     # ========================================================
 
-    response_text = response.text.strip()
+    json_parse_start = time.perf_counter()
+
+    text = response.text.strip()
 
 
-    # ========================================================
-    # REMOVE MARKDOWN CODE BLOCK IF PRESENT
-    # ========================================================
+    # Remove markdown JSON fences if Gemini returns them
 
-    if response_text.startswith("```"):
+    if text.startswith("```json"):
 
-        response_text = response_text.replace(
-            "```json",
-            ""
-        )
+        text = text[7:]
 
-        response_text = response_text.replace(
-            "```",
-            ""
-        )
+    elif text.startswith("```"):
 
-        response_text = response_text.strip()
+        text = text[3:]
 
 
-    # ========================================================
-    # PARSE JSON
-    # ========================================================
+    if text.endswith("```"):
 
-    json_start = time.perf_counter()
+        text = text[:-3]
+
+
+    text = text.strip()
+
 
     try:
 
-        analysis = json.loads(
-            response_text
-        )
+        analysis = json.loads(text)
 
-    except json.JSONDecodeError:
+    except Exception:
 
         analysis = {
             "person_present": False,
+
             "objects": [],
+
             "currency": {
                 "detected": False,
                 "denomination": "unknown",
                 "confidence": 0.0
             },
-            "summary": response_text
+
+            "summary": text
         }
 
-    json_end = time.perf_counter()
 
-    json_parse_time = (
-        json_end - json_start
+    json_parse_end = time.perf_counter()
+
+    json_parse_seconds = (
+        json_parse_end - json_parse_start
     )
 
 
@@ -288,10 +252,10 @@ Confidence must be a number between 0 and 1.
     # TOTAL SERVER TIME
     # ========================================================
 
-    total_end = time.perf_counter()
+    server_end = time.perf_counter()
 
-    total_time = (
-        total_end - total_start
+    server_total_seconds = (
+        server_end - server_start
     )
 
 
@@ -307,24 +271,16 @@ Confidence must be a number between 0 and 1.
 
         "latency": {
 
-            "image_read_seconds": round(
-                image_read_time,
-                4
-            ),
+            "image_read_seconds":
+                round(image_read_seconds, 4),
 
-            "gemini_seconds": round(
-                gemini_time,
-                4
-            ),
+            "gemini_seconds":
+                round(gemini_seconds, 4),
 
-            "json_parse_seconds": round(
-                json_parse_time,
-                6
-            ),
+            "json_parse_seconds":
+                round(json_parse_seconds, 6),
 
-            "server_total_seconds": round(
-                total_time,
-                4
-            )
+            "server_total_seconds":
+                round(server_total_seconds, 4)
         }
     }

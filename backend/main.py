@@ -21,7 +21,7 @@ if not GEMINI_API_KEY:
 
 
 # ============================================================
-# GEMINI
+# GEMINI CONFIGURATION
 # ============================================================
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -55,7 +55,7 @@ async def root():
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -68,7 +68,7 @@ async def health():
 
 
 # ============================================================
-# PING TEST
+# PING
 # ============================================================
 
 @app.get("/ping")
@@ -81,7 +81,75 @@ async def ping():
 
 
 # ============================================================
-# IMAGE ANALYSIS
+# UPLOAD TEST
+#
+# IMPORTANT:
+# This endpoint DOES NOT call Gemini.
+#
+# It only receives the image and measures how long the
+# Render server takes to read it.
+# ============================================================
+
+@app.post("/upload-test")
+async def upload_test(
+    file: UploadFile = File(...)
+):
+
+    server_start = time.perf_counter()
+
+
+    # --------------------------------------------------------
+    # Read uploaded image
+    # --------------------------------------------------------
+
+    image_read_start = time.perf_counter()
+
+    image_bytes = await file.read()
+
+    image_read_end = time.perf_counter()
+
+
+    image_read_seconds = (
+        image_read_end - image_read_start
+    )
+
+
+    # --------------------------------------------------------
+    # Total server time
+    # --------------------------------------------------------
+
+    server_end = time.perf_counter()
+
+    server_total_seconds = (
+        server_end - server_start
+    )
+
+
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
+
+    return {
+
+        "success": True,
+
+        "message": "Image received without Gemini",
+
+        "image_size_bytes": len(image_bytes),
+
+        "latency": {
+
+            "image_read_seconds":
+                round(image_read_seconds, 6),
+
+            "server_total_seconds":
+                round(server_total_seconds, 6)
+        }
+    }
+
+
+# ============================================================
+# GEMINI IMAGE ANALYSIS
 # ============================================================
 
 @app.post("/upload")
@@ -169,6 +237,7 @@ Use exactly this structure:
         model=MODEL_NAME,
 
         contents=[
+
             prompt,
 
             types.Part.from_bytes(
@@ -201,7 +270,7 @@ Use exactly this structure:
     text = response.text.strip()
 
 
-    # Remove markdown JSON fences if Gemini returns them
+    # Remove JSON markdown fences
 
     if text.startswith("```json"):
 
@@ -227,6 +296,7 @@ Use exactly this structure:
     except Exception:
 
         analysis = {
+
             "person_present": False,
 
             "objects": [],

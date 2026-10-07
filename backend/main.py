@@ -1,84 +1,173 @@
-﻿from fastapi import FastAPI, File, UploadFile, HTTPException
+﻿from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+
 from google import genai
 from google.genai import types
+
+from dotenv import load_dotenv
+
 import os
 import json
-from dotenv import load_dotenv
+import time
+
+
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
 
 load_dotenv()
 
-app = FastAPI()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 MODEL_NAME = "gemini-3.5-flash-lite"
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY is not configured.")
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+client = None
 
+if GEMINI_API_KEY:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="AI Smart Cap API",
+    description="AI Smart Cap vision analysis backend"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# ROOT
+# ============================================================
 
 @app.get("/")
-def home():
+def root():
+
     return {
-        "status": "online",
-        "message": "AI Smart Cap Cloud Server is running"
+        "message": "AI Smart Cap API is running",
+        "gemini_configured": client is not None,
+        "model": MODEL_NAME
     }
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy",
-        "gemini_configured": client is not None
+        "gemini_configured": client is not None,
+        "model": MODEL_NAME
     }
 
 
+# ============================================================
+# IMAGE UPLOAD + GEMINI ANALYSIS
+# ============================================================
+
 @app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
+async def upload_image(
+    file: UploadFile = File(...)
+):
+
+    # --------------------------------------------------------
+    # TOTAL SERVER TIMER
+    # --------------------------------------------------------
+
+    total_start = time.perf_counter()
+
+    print()
+    print("==============================================")
+    print("NEW IMAGE REQUEST")
+    print("==============================================")
+
+
+    # --------------------------------------------------------
+    # CHECK GEMINI
+    # --------------------------------------------------------
 
     if client is None:
-        raise HTTPException(
-            status_code=500,
-            detail="GEMINI_API_KEY is not configured on the server."
-        )
 
-    image_data = await file.read()
+        print("ERROR: Gemini API key is not configured.")
 
-    if not image_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty image received."
-        )
+        return {
+            "success": False,
+            "error": "Gemini API key is not configured"
+        }
 
-    mime_type = file.content_type or "image/jpeg"
+
+    # --------------------------------------------------------
+    # READ IMAGE
+    # --------------------------------------------------------
+
+    read_start = time.perf_counter()
+
+    image_bytes = await file.read()
+
+    read_end = time.perf_counter()
+
+    read_time = read_end - read_start
+
+    print(
+        f"Image read time: {read_time:.3f} seconds"
+    )
+
+    print(
+        f"Image size: {len(image_bytes)} bytes"
+    )
+
+
+    # --------------------------------------------------------
+    # GEMINI PROMPT
+    # --------------------------------------------------------
 
     prompt = """
-You are the visual intelligence system of an AI Smart Cap
-designed to assist a visually impaired user.
+You are the visual intelligence system of an assistive wearable
+for a visually impaired user.
 
-Analyze the supplied image carefully.
+Analyze the supplied image.
 
 Identify:
-1. Important everyday objects.
-2. Whether a person is present.
-3. Indian currency only if a currency note is clearly visible.
+
+1. Whether a person is present.
+2. Important everyday objects.
+3. Indian currency notes if clearly visible.
 4. Approximate position of important objects:
    left, center, or right.
-5. A short scene description suitable for spoken audio.
 
-Rules:
-- Do NOT identify or name people.
-- Do NOT guess objects that are not clearly visible.
-- Do NOT guess currency denomination.
-- If currency denomination is unclear, use "unknown".
-- Keep the spoken summary short.
-- Return ONLY valid JSON.
-- Do not use markdown.
-- Confidence must be between 0 and 1.
+Do NOT identify people.
 
-Use exactly this structure:
+Do NOT guess or invent objects.
+
+If currency denomination is unclear, return "unknown".
+
+Keep the summary short and suitable for spoken audio.
+
+Return ONLY valid JSON in exactly this structure:
 
 {
   "person_present": true,
@@ -92,69 +181,201 @@ Use exactly this structure:
   "currency": {
     "detected": false,
     "denomination": "unknown",
-    "confidence": 0
+    "confidence": 0.0
   },
-  "summary": "A chair is on the left."
+  "summary": "A person is present. A chair is on the left."
 }
 """
 
+
+    # --------------------------------------------------------
+    # GEMINI REQUEST
+    # --------------------------------------------------------
+
+    print()
+    print("Sending image to Gemini...")
+
+    gemini_start = time.perf_counter()
+
     try:
-        image_part = types.Part.from_bytes(
-            data=image_data,
-            mime_type=mime_type
-        )
 
         response = client.models.generate_content(
+
             model=MODEL_NAME,
+
             contents=[
-                image_part,
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg"
+                ),
                 prompt
             ]
         )
 
-        result_text = response.text.strip()
-
-        # Remove accidental markdown code fences
-        if result_text.startswith("```"):
-            result_text = result_text.replace("```json", "")
-            result_text = result_text.replace("```", "")
-            result_text = result_text.strip()
-
-        try:
-            result_json = json.loads(result_text)
-        except json.JSONDecodeError:
-            result_json = {
-                "person_present": False,
-                "objects": [],
-                "currency": {
-                    "detected": False,
-                    "denomination": "unknown",
-                    "confidence": 0
-                },
-                "summary": result_text
-            }
-
-        return {
-            "success": True,
-            "analysis": result_json
-        }
-
     except Exception as e:
-        print(f"Gemini error: {e}")
 
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gemini analysis failed: {str(e)}"
+        gemini_end = time.perf_counter()
+
+        gemini_time = gemini_end - gemini_start
+
+        print(
+            f"Gemini failed after: "
+            f"{gemini_time:.3f} seconds"
         )
 
+        print(f"Gemini error: {e}")
 
-if __name__ == "__main__":
-    import uvicorn
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
-    port = int(os.environ.get("PORT", 8080))
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
+    # --------------------------------------------------------
+    # GEMINI TIMING
+    # --------------------------------------------------------
+
+    gemini_end = time.perf_counter()
+
+    gemini_time = gemini_end - gemini_start
+
+    print()
+    print("----------------------------------------------")
+    print(
+        f"Gemini processing time: "
+        f"{gemini_time:.3f} seconds"
     )
+    print("----------------------------------------------")
+
+
+    # --------------------------------------------------------
+    # GET GEMINI TEXT
+    # --------------------------------------------------------
+
+    response_text = response.text.strip()
+
+    print()
+    print("Gemini raw response:")
+    print("----------------------------------------------")
+    print(response_text)
+    print("----------------------------------------------")
+
+
+    # --------------------------------------------------------
+    # REMOVE MARKDOWN CODE BLOCK IF PRESENT
+    # --------------------------------------------------------
+
+    if response_text.startswith("```"):
+
+        response_text = response_text.replace(
+            "```json",
+            ""
+        )
+
+        response_text = response_text.replace(
+            "```",
+            ""
+        )
+
+        response_text = response_text.strip()
+
+
+    # --------------------------------------------------------
+    # PARSE JSON
+    # --------------------------------------------------------
+
+    parse_start = time.perf_counter()
+
+    try:
+
+        analysis = json.loads(response_text)
+
+    except json.JSONDecodeError:
+
+        print("WARNING: Gemini returned invalid JSON.")
+
+        analysis = {
+            "person_present": False,
+            "objects": [],
+            "currency": {
+                "detected": False,
+                "denomination": "unknown",
+                "confidence": 0.0
+            },
+            "summary": response_text
+        }
+
+    parse_end = time.perf_counter()
+
+    parse_time = parse_end - parse_start
+
+    print(
+        f"JSON parsing time: "
+        f"{parse_time:.6f} seconds"
+    )
+
+
+    # --------------------------------------------------------
+    # TOTAL SERVER TIME
+    # --------------------------------------------------------
+
+    total_end = time.perf_counter()
+
+    total_time = total_end - total_start
+
+    print()
+    print("==============================================")
+    print("SERVER LATENCY")
+    print("==============================================")
+
+    print(
+        f"Image read       : {read_time:.3f} sec"
+    )
+
+    print(
+        f"Gemini           : {gemini_time:.3f} sec"
+    )
+
+    print(
+        f"JSON parsing     : {parse_time:.6f} sec"
+    )
+
+    print(
+        f"TOTAL SERVER     : {total_time:.3f} sec"
+    )
+
+    print("==============================================")
+    print()
+
+
+    # --------------------------------------------------------
+    # RETURN RESPONSE
+    # --------------------------------------------------------
+
+    return {
+        "success": True,
+
+        "analysis": analysis,
+
+        "latency": {
+            "image_read_seconds": round(
+                read_time,
+                3
+            ),
+
+            "gemini_seconds": round(
+                gemini_time,
+                3
+            ),
+
+            "json_parse_seconds": round(
+                parse_time,
+                6
+            ),
+
+            "server_total_seconds": round(
+                total_time,
+                3
+            )
+        }
+    }

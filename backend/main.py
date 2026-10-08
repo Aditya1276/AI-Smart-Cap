@@ -1,17 +1,21 @@
-﻿import os
+﻿import asyncio
 import json
+import os
 import time
+import uuid
+from pathlib import Path
 
+import edge_tts
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from google import genai
 from google.genai import types
 
 
-# ============================================================
-# LOAD ENVIRONMENT VARIABLES
-# ============================================================
+# =========================================================
+# ENVIRONMENT
+# =========================================================
 
 load_dotenv()
 
@@ -20,103 +24,72 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is not set")
 
-
-# ============================================================
-# GEMINI CONFIGURATION
-# ============================================================
-
 MODEL_NAME = "gemini-3.5-flash-lite"
 
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+RENDER_BASE_URL = "https://ai-smart-cap.onrender.com"
 
 
-# ============================================================
+# =========================================================
+# GEMINI
+# =========================================================
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# =========================================================
 # FASTAPI
-# ============================================================
+# =========================================================
 
 app = FastAPI(
     title="AI Smart Cap Backend",
-    description="ESP32-CAM -> Gemini Vision Backend",
-    version="1.0"
+    description="Vision + Gemini + TTS backend for AI Smart Cap",
+    version="1.0.0"
 )
 
 
-# ============================================================
-# ROOT
-# ============================================================
+# =========================================================
+# AUDIO DIRECTORY
+# =========================================================
 
-@app.get("/")
-def root():
-
-    return {
-        "success": True,
-        "message": "AI Smart Cap backend is running"
-    }
+AUDIO_DIR = Path("audio")
+AUDIO_DIR.mkdir(exist_ok=True)
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-def health():
-
-    return {
-        "success": True,
-        "status": "healthy"
-    }
+TTS_VOICE = "en-IN-NeerjaNeural"
 
 
-# ============================================================
-# PING
-# ============================================================
-
-@app.get("/ping")
-def ping():
-
-    return {
-        "success": True,
-        "message": "pong"
-    }
-
-
-# ============================================================
+# =========================================================
 # GEMINI PROMPT
-# ============================================================
+# =========================================================
 
 PROMPT = """
-You are the visual intelligence system of an assistive wearable
-for a visually impaired user.
+You are the visual intelligence system of an assistive wearable for a visually impaired user.
 
-Analyze the supplied image carefully.
+Analyze the supplied image.
 
 Identify:
 
-1. Whether a person is present.
-2. Important everyday objects visible in the image.
-3. Approximate position of each important object:
+1. Important everyday objects that are clearly visible.
+2. Whether a person is present.
+3. Indian currency notes if clearly visible.
+4. Approximate position of important objects:
    - left
    - center
    - right
-4. Indian currency notes if clearly visible.
-5. A short description suitable for spoken audio.
 
-IMPORTANT RULES:
+Rules:
 
-- Do not identify people.
-- Do not guess objects that are not clearly visible.
-- Do not invent information.
-- Only report important objects.
-- For currency, identify the denomination only when reasonably clear.
-- If currency is unclear, use "unknown".
-- Keep the summary short and natural for text-to-speech.
-- Confidence must be between 0 and 1.
+- Do NOT identify people.
+- Do NOT guess or invent objects.
+- Only report objects that are clearly visible.
+- Ignore unimportant tiny background objects.
+- If currency denomination is unclear, return "unknown".
+- Do not hallucinate currency.
+- Keep the spoken summary very short.
+- The summary must be suitable for text-to-speech.
+- Do not include unnecessary technical details.
 
-Return ONLY valid JSON.
-
-Use exactly this structure:
+Return ONLY valid JSON in this exact structure:
 
 {
   "person_present": true,
@@ -132,12 +105,20 @@ Use exactly this structure:
     "denomination": "500 INR",
     "confidence": 0.94
   },
-  "summary": "A person is present. A chair is on the left and a 500 rupee note is visible."
+  "summary": "A person is ahead. A chair is on your left and a 500-rupee note is visible."
 }
 
-If no currency is visible:
+If no object is detected:
 
-{
+"objects": []
+
+If no person is detected:
+
+"person_present": false
+
+If currency is not detected:
+
+"currency": {
   "detected": false,
   "denomination": "unknown",
   "confidence": 0.0
@@ -145,272 +126,489 @@ If no currency is visible:
 """
 
 
-# ============================================================
-# UPLOAD IMAGE
-# ============================================================
+# =========================================================
+# TTS
+# =========================================================
+
+async def generate_tts(text: str, output_file: str):
+
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice=TTS_VOICE,
+        rate="+0%",
+        volume="+0%"
+    )
+
+    await communicate.save(output_file)
+
+
+# =========================================================
+# GEMINI FUNCTION
+# =========================================================
+
+def call_gemini(image_bytes: bytes):
+
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[
+            PROMPT,
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type="image/jpeg"
+            )
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(
+                thinking_level="minimal"
+            )
+        )
+    )
+
+    return response
+
+
+# =========================================================
+# JSON CLEANING
+# =========================================================
+
+def clean_json_text(text: str):
+
+    text = text.strip()
+
+    if text.startswith("```json"):
+        text = text[7:]
+
+    elif text.startswith("```"):
+        text = text[3:]
+
+    if text.endswith("```"):
+        text = text[:-3]
+
+    return text.strip()
+
+
+# =========================================================
+# ROOT
+# =========================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "success": True,
+        "project": "AI Smart Cap",
+        "message": "Backend is running"
+    }
+
+
+# =========================================================
+# HEALTH
+# =========================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "success": True,
+        "status": "healthy"
+    }
+
+
+# =========================================================
+# PING
+# =========================================================
+
+@app.get("/ping")
+def ping():
+
+    return {
+        "success": True,
+        "message": "pong"
+    }
+
+
+# =========================================================
+# TTS TEST
+# =========================================================
+
+@app.get("/tts-test")
+async def tts_test():
+
+    filename = f"test_{uuid.uuid4().hex}.mp3"
+
+    output_file = AUDIO_DIR / filename
+
+    try:
+
+        await asyncio.wait_for(
+            generate_tts(
+                "AI Smart Cap audio test successful.",
+                str(output_file)
+            ),
+            timeout=15
+        )
+
+        audio_url = f"{RENDER_BASE_URL}/audio/{filename}"
+
+        return {
+            "success": True,
+            "message": "TTS generated successfully",
+            "audio_url": audio_url
+        }
+
+    except Exception as e:
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e)
+            }
+        )
+
+
+# =========================================================
+# AUDIO FILE
+# =========================================================
+
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+
+    file_path = AUDIO_DIR / filename
+
+    if not file_path.exists():
+
+        return JSONResponse(
+            status_code=404,
+            content={
+                "success": False,
+                "error": "Audio file not found"
+            }
+        )
+
+    return FileResponse(
+        path=file_path,
+        media_type="audio/mpeg",
+        filename=filename
+    )
+
+
+# =========================================================
+# DIRECT TTS
+# =========================================================
+
+@app.post("/tts")
+async def tts_endpoint(text: str):
+
+    filename = f"tts_{uuid.uuid4().hex}.mp3"
+
+    output_file = AUDIO_DIR / filename
+
+    try:
+
+        await asyncio.wait_for(
+            generate_tts(
+                text,
+                str(output_file)
+            ),
+            timeout=15
+        )
+
+        audio_url = f"{RENDER_BASE_URL}/audio/{filename}"
+
+        return {
+            "success": True,
+            "text": text,
+            "audio_url": audio_url
+        }
+
+    except Exception as e:
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": str(e)
+            }
+        )
+
+
+# =========================================================
+# MAIN UPLOAD
+# =========================================================
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
 
-    server_start = time.perf_counter()
+    total_start = time.perf_counter()
+
+    # -----------------------------------------------------
+    # READ IMAGE
+    # -----------------------------------------------------
+
+    image_start = time.perf_counter()
+
+    image_bytes = await file.read()
+
+    image_read_seconds = (
+        time.perf_counter() - image_start
+    )
+
+    print()
+    print("========================================")
+    print("IMAGE RECEIVED")
+    print("========================================")
+    print("Filename:", file.filename)
+    print("Image size:", len(image_bytes), "bytes")
+
+    # -----------------------------------------------------
+    # GEMINI
+    # -----------------------------------------------------
+
+    gemini_start = time.perf_counter()
+
+    print("Sending image to Gemini...")
 
     try:
 
-        # ----------------------------------------------------
-        # READ IMAGE
-        # ----------------------------------------------------
-
-        image_start = time.perf_counter()
-
-        image_bytes = await file.read()
-
-        image_read_time = time.perf_counter() - image_start
-
-        if not image_bytes:
-
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": "Empty image received"
-                }
-            )
-
-
-        print()
-        print("========================================")
-        print("IMAGE RECEIVED")
-        print("========================================")
-
-        print("Filename:", file.filename)
-        print("Content type:", file.content_type)
-        print("Image size:", len(image_bytes), "bytes")
-
-
-        # ----------------------------------------------------
-        # GEMINI
-        # ----------------------------------------------------
-
-        gemini_start = time.perf_counter()
-
-        response = client.models.generate_content(
-
-            model=MODEL_NAME,
-
-            contents=[
-                PROMPT,
-
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg"
-                )
-            ],
-
-            config=types.GenerateContentConfig(
-
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                )
-            )
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                call_gemini,
+                image_bytes
+            ),
+            timeout=30
         )
 
-        gemini_time = time.perf_counter() - gemini_start
+    except asyncio.TimeoutError:
 
-
-        # ----------------------------------------------------
-        # GET GEMINI TEXT
-        # ----------------------------------------------------
-
-        raw_text = response.text.strip()
-
-        print()
-        print("GEMINI RESPONSE:")
-        print(raw_text)
-
-
-        # ----------------------------------------------------
-        # PARSE JSON
-        # ----------------------------------------------------
-
-        json_start = time.perf_counter()
-
-        try:
-
-            # Remove markdown JSON fences if Gemini returns them
-            cleaned_text = raw_text
-
-            if cleaned_text.startswith("```json"):
-                cleaned_text = cleaned_text[7:]
-
-            elif cleaned_text.startswith("```"):
-                cleaned_text = cleaned_text[3:]
-
-            if cleaned_text.endswith("```"):
-                cleaned_text = cleaned_text[:-3]
-
-            cleaned_text = cleaned_text.strip()
-
-            analysis = json.loads(cleaned_text)
-
-        except json.JSONDecodeError:
-
-            print("WARNING: Gemini returned invalid JSON")
-
-            analysis = {
-                "person_present": False,
-                "objects": [],
-                "currency": {
-                    "detected": False,
-                    "denomination": "unknown",
-                    "confidence": 0.0
-                },
-                "summary": raw_text
+        return JSONResponse(
+            status_code=504,
+            content={
+                "success": False,
+                "error": "Gemini request timed out"
             }
-
-
-        json_parse_time = time.perf_counter() - json_start
-
-
-        # ----------------------------------------------------
-        # TOTAL SERVER TIME
-        # ----------------------------------------------------
-
-        server_total_time = time.perf_counter() - server_start
-
-
-        # ----------------------------------------------------
-        # PRINT LATENCY
-        # ----------------------------------------------------
-
-        print()
-        print("========================================")
-        print("LATENCY")
-        print("========================================")
-
-        print(
-            "Image read:",
-            round(image_read_time, 4),
-            "seconds"
         )
-
-        print(
-            "Gemini:",
-            round(gemini_time, 4),
-            "seconds"
-        )
-
-        print(
-            "JSON parse:",
-            round(json_parse_time, 6),
-            "seconds"
-        )
-
-        print(
-            "Server total:",
-            round(server_total_time, 4),
-            "seconds"
-        )
-
-        print("========================================")
-        print()
-
-
-        # ----------------------------------------------------
-        # RESPONSE TO ESP32
-        # ----------------------------------------------------
-
-        return {
-            "success": True,
-
-            "analysis": analysis,
-
-            "latency": {
-                "image_read_seconds": round(
-                    image_read_time,
-                    4
-                ),
-
-                "gemini_seconds": round(
-                    gemini_time,
-                    4
-                ),
-
-                "json_parse_seconds": round(
-                    json_parse_time,
-                    6
-                ),
-
-                "server_total_seconds": round(
-                    server_total_time,
-                    4
-                )
-            }
-        }
-
 
     except Exception as e:
 
-        print()
-        print("========================================")
-        print("ERROR")
-        print("========================================")
-
-        print(str(e))
-
-        print("========================================")
-
+        print("Gemini error:", e)
 
         return JSONResponse(
-
             status_code=500,
-
             content={
                 "success": False,
-                "error": str(e)
+                "error": f"Gemini error: {str(e)}"
             }
         )
 
+    gemini_seconds = (
+        time.perf_counter() - gemini_start
+    )
 
-# ============================================================
-# UPLOAD TEST
-# ============================================================
+    print(
+        f"Gemini completed in "
+        f"{gemini_seconds:.2f} seconds"
+    )
+
+    # -----------------------------------------------------
+    # RESPONSE TEXT
+    # -----------------------------------------------------
+
+    raw_text = response.text or ""
+
+    print()
+    print("GEMINI RAW RESPONSE")
+    print("----------------------------------------")
+    print(raw_text)
+    print("----------------------------------------")
+
+    # -----------------------------------------------------
+    # JSON PARSE
+    # -----------------------------------------------------
+
+    json_start = time.perf_counter()
+
+    try:
+
+        cleaned_text = clean_json_text(raw_text)
+
+        analysis = json.loads(cleaned_text)
+
+    except Exception as e:
+
+        print("JSON parsing failed:", e)
+
+        analysis = {
+            "person_present": False,
+            "objects": [],
+            "currency": {
+                "detected": False,
+                "denomination": "unknown",
+                "confidence": 0.0
+            },
+            "summary": "Unable to analyze the image."
+        }
+
+    json_parse_seconds = (
+        time.perf_counter() - json_start
+    )
+
+    # -----------------------------------------------------
+    # SUMMARY
+    # -----------------------------------------------------
+
+    summary = analysis.get(
+        "summary",
+        "No important objects detected."
+    )
+
+    if not summary:
+
+        summary = "No important objects detected."
+
+    print()
+    print("SUMMARY")
+    print("----------------------------------------")
+    print(summary)
+    print("----------------------------------------")
+
+    # -----------------------------------------------------
+    # TTS
+    # -----------------------------------------------------
+
+    tts_start = time.perf_counter()
+
+    audio_filename = (
+        f"speech_{uuid.uuid4().hex}.mp3"
+    )
+
+    audio_path = AUDIO_DIR / audio_filename
+
+    tts_success = False
+    audio_url = None
+    tts_error = None
+
+    print("Generating TTS...")
+
+    try:
+
+        await asyncio.wait_for(
+            generate_tts(
+                summary,
+                str(audio_path)
+            ),
+            timeout=15
+        )
+
+        tts_success = True
+
+        audio_url = (
+            f"{RENDER_BASE_URL}/audio/"
+            f"{audio_filename}"
+        )
+
+        print("TTS completed")
+        print("Audio URL:", audio_url)
+
+    except Exception as e:
+
+        tts_error = str(e)
+
+        print(
+            "TTS failed:",
+            tts_error
+        )
+
+    tts_seconds = (
+        time.perf_counter() - tts_start
+    )
+
+    # -----------------------------------------------------
+    # TOTAL
+    # -----------------------------------------------------
+
+    server_total_seconds = (
+        time.perf_counter() - total_start
+    )
+
+    print()
+    print("========================================")
+    print("REQUEST COMPLETE")
+    print("========================================")
+
+    print(
+        f"Image read: {image_read_seconds:.3f}s"
+    )
+
+    print(
+        f"Gemini: {gemini_seconds:.3f}s"
+    )
+
+    print(
+        f"JSON parse: {json_parse_seconds:.3f}s"
+    )
+
+    print(
+        f"TTS: {tts_seconds:.3f}s"
+    )
+
+    print(
+        f"Total: {server_total_seconds:.3f}s"
+    )
+
+    print("========================================")
+    print()
+
+    # -----------------------------------------------------
+    # RESPONSE
+    # -----------------------------------------------------
+
+    return {
+        "success": True,
+
+        "analysis": analysis,
+
+        "audio": {
+            "success": tts_success,
+            "audio_url": audio_url,
+            "error": tts_error
+        },
+
+        "latency": {
+
+            "image_read_seconds":
+                round(image_read_seconds, 4),
+
+            "gemini_seconds":
+                round(gemini_seconds, 4),
+
+            "json_parse_seconds":
+                round(json_parse_seconds, 4),
+
+            "tts_seconds":
+                round(tts_seconds, 4),
+
+            "server_total_seconds":
+                round(server_total_seconds, 4)
+        }
+    }
+
+
+# =========================================================
+# TEST UPLOAD
+# =========================================================
 
 @app.post("/upload-test")
-async def upload_test(file: UploadFile = File(...)):
+async def upload_test(
+    file: UploadFile = File(...)
+):
 
-    start = time.perf_counter()
+    image_bytes = await file.read()
 
-    try:
-
-        image_bytes = await file.read()
-
-        total_time = time.perf_counter() - start
-
-        return {
-            "success": True,
-
-            "message": "Image received without Gemini",
-
-            "filename": file.filename,
-
-            "image_size_bytes": len(image_bytes),
-
-            "latency": {
-                "server_total_seconds": round(
-                    total_time,
-                    6
-                )
-            }
-        }
-
-    except Exception as e:
-
-        return JSONResponse(
-
-            status_code=500,
-
-            content={
-                "success": False,
-                "error": str(e)
-            }
-        )
+    return {
+        "success": True,
+        "filename": file.filename,
+        "size": len(image_bytes),
+        "message": "Upload test successful"
+    }

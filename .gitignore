@@ -6,3 +6,5 @@ test_images/
 *.pyc
 *.jpg
 *.jpeg
+audio/
+response.json

@@ -5,19 +5,18 @@ import time
 import asyncio
 from pathlib import Path
 
-import edge_tts
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from google import genai
 from google.genai import types
 
+import edge_tts
+
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# LOAD ENVIRONMENT
 # ============================================================
 
 load_dotenv()
@@ -25,25 +24,11 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY is missing. "
-        "Add it to your .env file locally or Render Environment Variables."
-    )
+    raise RuntimeError("GEMINI_API_KEY is not set")
 
+MODEL_NAME = "gemini-3.5-flash-lite"
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-MODEL_NAME = os.getenv(
-    "GEMINI_MODEL",
-    "gemini-3.5-flash-lite"
-)
-
-RENDER_BASE_URL = os.getenv(
-    "RENDER_BASE_URL",
-    "https://ai-smart-cap.onrender.com"
-).rstrip("/")
+RENDER_BASE_URL = "https://ai-smart-cap.onrender.com"
 
 
 # ============================================================
@@ -52,145 +37,136 @@ RENDER_BASE_URL = os.getenv(
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-RECEIVED_IMAGES_DIR = BASE_DIR / "received_images"
 AUDIO_DIR = BASE_DIR / "audio"
+RECEIVED_DIR = BASE_DIR / "received_images"
 
-RECEIVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
-
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
+AUDIO_DIR.mkdir(exist_ok=True)
+RECEIVED_DIR.mkdir(exist_ok=True)
 
 
 # ============================================================
-# FASTAPI APP
+# GEMINI
 # ============================================================
 
-app = FastAPI(
-    title="AI Smart Cap Backend",
-    description="Backend for AI Smart Cap visual assistance system",
-    version="1.0.0"
-)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-
-# ============================================================
-# SERVE AUDIO FILES
-# ============================================================
-
-app.mount(
-    "/audio",
-    StaticFiles(directory=str(AUDIO_DIR)),
-    name="audio"
-)
-
-
-# ============================================================
-# GEMINI PROMPT
-# ============================================================
 
 PROMPT = """
 You are the visual intelligence system of an assistive wearable
 for a visually impaired user.
 
-Analyze the supplied image carefully.
+Analyze the supplied image.
 
-Your tasks:
+Identify:
 
-1. Detect important everyday objects.
-2. Detect whether a person is present.
-3. Detect Indian currency notes if clearly visible.
-4. Estimate the approximate position of important objects:
+1. Important everyday objects.
+2. Whether a person is present.
+3. Indian currency notes if clearly visible.
+4. Approximate position of objects:
    - left
    - center
    - right
-5. Create a very short spoken summary.
-6. Do not identify or name people.
-7. Do not guess objects that are not clearly visible.
-8. Do not invent currency denominations.
-9. If currency is unclear, return denomination as "unknown".
-10. Only include useful objects that matter for an assistive system.
-11. Keep the summary short and natural for text-to-speech.
 
-IMPORTANT:
-Return ONLY valid JSON.
+Do not identify people.
 
-Required JSON structure:
+Do not guess or invent objects.
+
+If currency denomination is unclear, return unknown.
+
+Keep the spoken summary short and useful.
+
+Return ONLY valid JSON in this exact structure:
 
 {
-    "person_present": true,
-    "objects": [
-        {
-            "name": "chair",
-            "position": "left",
-            "confidence": 0.92
-        }
-    ],
-    "currency": {
-        "detected": true,
-        "denomination": "500 INR",
-        "confidence": 0.94
-    },
-    "summary": "A person is ahead. A chair is on your left."
-}
-
-If no person is detected:
-
-"person_present": false
-
-If no useful objects are detected:
-
-"objects": []
-
-If currency is not visible:
-
-{
+  "person_present": true,
+  "objects": [
+    {
+      "name": "chair",
+      "position": "left",
+      "confidence": 0.92
+    }
+  ],
+  "currency": {
     "detected": false,
     "denomination": "unknown",
     "confidence": 0.0
+  },
+  "summary": "A person is present. A chair is on your left."
 }
-
-Confidence must be between 0.0 and 1.0.
-
-Position must be one of:
-
-"left"
-"center"
-"right"
-
-Do not include explanations outside the JSON.
 """
 
 
 # ============================================================
-# HEALTH CHECK
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="AI Smart Cap Backend",
+    version="2.0"
+)
+
+
+# ============================================================
+# LATEST RESULT STORAGE
+# ============================================================
+
+# Device ID -> latest result
+latest_results = {}
+
+# Used to make sure the same result is not returned repeatedly
+result_counter = {}
+
+
+# ============================================================
+# TTS
+# ============================================================
+
+async def generate_tts(text: str, output_file: str):
+
+    communicate = edge_tts.Communicate(
+        text=text,
+        voice="en-IN-NeerjaNeural",
+        rate="+0%",
+        volume="+0%"
+    )
+
+    await communicate.save(output_file)
+
+
+# ============================================================
+# ROOT
 # ============================================================
 
 @app.get("/")
 async def root():
+
     return {
         "success": True,
-        "project": "AI Smart Cap",
-        "message": "AI Smart Cap backend is running",
-        "version": "1.0.0"
+        "service": "AI Smart Cap Backend",
+        "status": "running"
     }
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.get("/health")
 async def health():
+
     return {
         "success": True,
         "status": "healthy"
     }
 
 
+# ============================================================
+# PING
+# ============================================================
+
 @app.get("/ping")
 async def ping():
+
     return {
         "success": True,
         "message": "pong"
@@ -198,480 +174,232 @@ async def ping():
 
 
 # ============================================================
-# GEMINI ANALYSIS
-# ============================================================
-
-async def analyze_image_with_gemini(image_bytes: bytes):
-    """
-    Send image to Gemini and return structured JSON.
-    """
-
-    def generate():
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-
-            contents=[
-                PROMPT,
-
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type="image/jpeg"
-                )
-            ],
-
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-
-                thinking_config=types.ThinkingConfig(
-                    thinking_level="minimal"
-                )
-            )
-        )
-
-        return response.text
-
-    try:
-
-        result_text = await asyncio.wait_for(
-            asyncio.to_thread(generate),
-            timeout=30
-        )
-
-    except asyncio.TimeoutError:
-        raise RuntimeError(
-            "Gemini request timed out after 30 seconds."
-        )
-
-    except Exception as e:
-        raise RuntimeError(
-            f"Gemini API error: {str(e)}"
-        )
-
-    if not result_text:
-        raise RuntimeError(
-            "Gemini returned an empty response."
-        )
-
-    # --------------------------------------------------------
-    # Clean possible markdown JSON
-    # --------------------------------------------------------
-
-    result_text = result_text.strip()
-
-    if result_text.startswith("```json"):
-        result_text = result_text[7:]
-
-    elif result_text.startswith("```"):
-        result_text = result_text[3:]
-
-    if result_text.endswith("```"):
-        result_text = result_text[:-3]
-
-    result_text = result_text.strip()
-
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
-
-    try:
-
-        analysis = json.loads(result_text)
-
-    except json.JSONDecodeError as e:
-
-        raise RuntimeError(
-            f"Gemini returned invalid JSON: {str(e)}\n"
-            f"Raw response: {result_text}"
-        )
-
-    return analysis
-
-
-# ============================================================
-# VALIDATE / NORMALIZE GEMINI RESPONSE
-# ============================================================
-
-def normalize_analysis(data):
-
-    # --------------------------------------------------------
-    # person_present
-    # --------------------------------------------------------
-
-    person_present = bool(
-        data.get("person_present", False)
-    )
-
-    # --------------------------------------------------------
-    # objects
-    # --------------------------------------------------------
-
-    objects = data.get("objects", [])
-
-    if not isinstance(objects, list):
-        objects = []
-
-    clean_objects = []
-
-    for obj in objects:
-
-        if not isinstance(obj, dict):
-            continue
-
-        name = str(
-            obj.get("name", "unknown")
-        ).strip()
-
-        position = str(
-            obj.get("position", "center")
-        ).strip().lower()
-
-        if position not in [
-            "left",
-            "center",
-            "right"
-        ]:
-            position = "center"
-
-        try:
-            confidence = float(
-                obj.get("confidence", 0.0)
-            )
-        except:
-            confidence = 0.0
-
-        confidence = max(
-            0.0,
-            min(1.0, confidence)
-        )
-
-        if name and name.lower() != "unknown":
-
-            clean_objects.append({
-                "name": name,
-                "position": position,
-                "confidence": round(
-                    confidence,
-                    2
-                )
-            })
-
-    # --------------------------------------------------------
-    # currency
-    # --------------------------------------------------------
-
-    currency = data.get("currency", {})
-
-    if not isinstance(currency, dict):
-        currency = {}
-
-    currency_detected = bool(
-        currency.get("detected", False)
-    )
-
-    denomination = str(
-        currency.get(
-            "denomination",
-            "unknown"
-        )
-    ).strip()
-
-    try:
-        currency_confidence = float(
-            currency.get(
-                "confidence",
-                0.0
-            )
-        )
-    except:
-        currency_confidence = 0.0
-
-    currency_confidence = max(
-        0.0,
-        min(1.0, currency_confidence)
-    )
-
-    if not currency_detected:
-        denomination = "unknown"
-        currency_confidence = 0.0
-
-    # --------------------------------------------------------
-    # summary
-    # --------------------------------------------------------
-
-    summary = str(
-        data.get(
-            "summary",
-            "No important objects detected."
-        )
-    ).strip()
-
-    if not summary:
-        summary = "No important objects detected."
-
-    return {
-        "person_present": person_present,
-
-        "objects": clean_objects,
-
-        "currency": {
-            "detected": currency_detected,
-            "denomination": denomination,
-            "confidence": round(
-                currency_confidence,
-                2
-            )
-        },
-
-        "summary": summary
-    }
-
-
-# ============================================================
-# TEXT TO SPEECH
-# ============================================================
-
-async def generate_tts(
-    text: str,
-    output_file: str
-):
-
-    communicate = edge_tts.Communicate(
-        text=text,
-
-        # Indian English female voice
-        voice="en-IN-NeerjaNeural",
-
-        rate="+0%",
-        volume="+0%"
-    )
-
-    await communicate.save(
-        output_file
-    )
-
-
-# ============================================================
-# UPLOAD IMAGE + AI ANALYSIS + TTS
+# UPLOAD IMAGE
 # ============================================================
 
 @app.post("/upload")
 async def upload_image(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    device_id: str = "audio01"
 ):
 
-    request_start = time.perf_counter()
+    start_time = time.time()
 
-    # ========================================================
-    # READ IMAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # Validate image
+    # --------------------------------------------------------
 
-    image_start = time.perf_counter()
-
-    try:
-
-        image_bytes = await file.read()
-
-    except Exception as e:
-
-        return JSONResponse(
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(
             status_code=400,
-            content={
-                "success": False,
-                "error": f"Could not read image: {str(e)}"
-            }
+            detail="Uploaded file is not an image"
         )
 
-    image_read_seconds = (
-        time.perf_counter() - image_start
-    )
+    # --------------------------------------------------------
+    # Read image
+    # --------------------------------------------------------
 
-    if not image_bytes:
+    image_bytes = await file.read()
 
-        return JSONResponse(
+    if len(image_bytes) == 0:
+        raise HTTPException(
             status_code=400,
-            content={
-                "success": False,
-                "error": "Empty image received."
-            }
+            detail="Empty image"
         )
 
-    # ========================================================
-    # CHECK IMAGE SIZE
-    # ========================================================
+    image_read_seconds = time.time() - start_time
 
-    image_size = len(image_bytes)
-
-    if image_size > 10 * 1024 * 1024:
-
-        return JSONResponse(
-            status_code=413,
-            content={
-                "success": False,
-                "error": "Image is larger than 10 MB."
-            }
-        )
-
-    # ========================================================
-    # SAVE IMAGE
-    # ========================================================
+    # --------------------------------------------------------
+    # Save image
+    # --------------------------------------------------------
 
     image_filename = (
-        f"{uuid.uuid4().hex}.jpg"
+        uuid.uuid4().hex +
+        Path(file.filename or "camera.jpg").suffix
     )
 
-    image_path = (
-        RECEIVED_IMAGES_DIR /
-        image_filename
-    )
+    image_path = RECEIVED_DIR / image_filename
+
+    image_path.write_bytes(image_bytes)
+
+    # --------------------------------------------------------
+    # Gemini
+    # --------------------------------------------------------
+
+    gemini_start = time.time()
 
     try:
 
-        image_path.write_bytes(
-            image_bytes
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.models.generate_content,
+
+                model=MODEL_NAME,
+
+                contents=[
+                    PROMPT,
+
+                    types.Part.from_bytes(
+                        data=image_bytes,
+                        mime_type="image/jpeg"
+                    )
+                ],
+
+                config=types.GenerateContentConfig(
+
+                    response_mime_type="application/json",
+
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level="minimal"
+                    )
+                )
+            ),
+
+            timeout=30
+        )
+
+    except asyncio.TimeoutError:
+
+        raise HTTPException(
+            status_code=504,
+            detail="Gemini request timed out"
         )
 
     except Exception as e:
 
-        return JSONResponse(
+        raise HTTPException(
             status_code=500,
-            content={
-                "success": False,
-                "error": f"Could not save image: {str(e)}"
-            }
+            detail=f"Gemini error: {str(e)}"
         )
 
-    # ========================================================
-    # GEMINI
-    # ========================================================
+    gemini_seconds = time.time() - gemini_start
 
-    gemini_start = time.perf_counter()
+    # --------------------------------------------------------
+    # Parse Gemini JSON
+    # --------------------------------------------------------
+
+    json_parse_start = time.time()
 
     try:
 
-        raw_analysis = (
-            await analyze_image_with_gemini(
-                image_bytes
-            )
-        )
+        analysis = json.loads(response.text)
 
     except Exception as e:
 
-        return JSONResponse(
+        raise HTTPException(
             status_code=500,
-            content={
-                "success": False,
-                "error": str(e)
-            }
+            detail=f"Invalid Gemini JSON: {str(e)}"
         )
 
-    gemini_seconds = (
-        time.perf_counter() - gemini_start
+    json_parse_seconds = time.time() - json_parse_start
+
+    # --------------------------------------------------------
+    # Get spoken summary
+    # --------------------------------------------------------
+
+    summary = analysis.get(
+        "summary",
+        "No important objects detected."
     )
 
-    # ========================================================
-    # NORMALIZE JSON
-    # ========================================================
+    # --------------------------------------------------------
+    # Generate TTS
+    # --------------------------------------------------------
 
-    json_start = time.perf_counter()
+    tts_start = time.time()
 
-    try:
+    audio_filename = f"speech_{uuid.uuid4().hex}.mp3"
 
-        analysis = normalize_analysis(
-            raw_analysis
-        )
-
-    except Exception as e:
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": f"JSON normalization error: {str(e)}"
-            }
-        )
-
-    json_parse_seconds = (
-        time.perf_counter() - json_start
-    )
-
-    # ========================================================
-    # TTS
-    # ========================================================
-
-    tts_start = time.perf_counter()
-
-    audio_filename = (
-        f"speech_{uuid.uuid4().hex}.mp3"
-    )
-
-    audio_path = (
-        AUDIO_DIR /
-        audio_filename
-    )
+    audio_path = AUDIO_DIR / audio_filename
 
     try:
 
         await generate_tts(
-            analysis["summary"],
+            summary,
             str(audio_path)
         )
 
-        tts_success = True
-        tts_error = None
-
     except Exception as e:
 
-        tts_success = False
-        tts_error = str(e)
-
-    tts_seconds = (
-        time.perf_counter() - tts_start
-    )
-
-    # ========================================================
-    # AUDIO URL
-    # ========================================================
-
-    audio_url = None
-
-    if tts_success:
-
-        audio_url = (
-            f"{RENDER_BASE_URL}"
-            f"/audio/{audio_filename}"
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS error: {str(e)}"
         )
 
-    # ========================================================
-    # TOTAL TIME
-    # ========================================================
+    tts_seconds = time.time() - tts_start
 
-    total_seconds = (
-        time.perf_counter()
-        - request_start
+    # --------------------------------------------------------
+    # Audio URL
+    # --------------------------------------------------------
+
+    audio_url = (
+        f"{RENDER_BASE_URL}/audio/{audio_filename}"
     )
 
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
+    # --------------------------------------------------------
+    # Create result ID
+    # --------------------------------------------------------
+
+    current_counter = result_counter.get(device_id, 0) + 1
+
+    result_counter[device_id] = current_counter
+
+    result_id = str(current_counter)
+
+    # --------------------------------------------------------
+    # Store result for ESP32 Audio Board
+    # --------------------------------------------------------
+
+    latest_results[device_id] = {
+
+        "result_id": result_id,
+
+        "audio_url": audio_url,
+
+        "summary": summary,
+
+        "analysis": analysis,
+
+        "created_at": time.time()
+    }
+
+    server_total_seconds = time.time() - start_time
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # We return the response to the camera only so that
+    # the HTTP request completes successfully.
+    #
+    # The camera does NOT need to use this response.
+    #
+    # The audio ESP32 gets the same result independently
+    # through /next-audio/{device_id}
+    # --------------------------------------------------------
 
     return {
+
         "success": True,
 
         "analysis": analysis,
 
         "audio": {
-            "success": tts_success,
+
+            "success": True,
+
             "audio_url": audio_url,
-            "error": tts_error
+
+            "error": None
         },
 
         "image": {
+
             "filename": image_filename,
-            "size_bytes": image_size
+
+            "size_bytes": len(image_bytes)
         },
 
         "latency": {
+
             "image_read_seconds": round(
                 image_read_seconds,
                 4
@@ -693,7 +421,7 @@ async def upload_image(
             ),
 
             "server_total_seconds": round(
-                total_seconds,
+                server_total_seconds,
                 4
             )
         }
@@ -701,64 +429,65 @@ async def upload_image(
 
 
 # ============================================================
-# TEST TTS ENDPOINT
+# AUDIO POLLING ENDPOINT
 # ============================================================
 
-@app.get("/tts")
-async def test_tts():
+@app.get("/next-audio/{device_id}")
+async def next_audio(
+    device_id: str,
+    last_id: str = "0"
+):
 
-    text = (
-        "AI Smart Cap audio test successful."
-    )
+    result = latest_results.get(device_id)
 
-    filename = (
-        f"test_{uuid.uuid4().hex}.mp3"
-    )
+    # No result available
+    if result is None:
 
-    output_path = (
-        AUDIO_DIR /
-        filename
-    )
+        return {
+            "success": True,
+            "new_audio": False
+        }
 
-    try:
+    # Same result as previous request
+    if result["result_id"] == last_id:
 
-        await generate_tts(
-            text,
-            str(output_path)
-        )
+        return {
+            "success": True,
+            "new_audio": False
+        }
 
-    except Exception as e:
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": str(e)
-            }
-        )
-
-    audio_url = (
-        f"{RENDER_BASE_URL}"
-        f"/audio/{filename}"
-    )
-
+    # New result
     return {
+
         "success": True,
-        "message": "TTS test successful",
-        "audio_url": audio_url
+
+        "new_audio": True,
+
+        "result_id": result["result_id"],
+
+        "audio_url": result["audio_url"],
+
+        "summary": result["summary"]
     }
 
 
 # ============================================================
-# SERVER START MESSAGE
+# AUDIO FILE
 # ============================================================
 
-if __name__ == "__main__":
+@app.get("/audio/{filename}")
+async def get_audio(filename: str):
 
-    import uvicorn
+    audio_path = AUDIO_DIR / filename
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000
+    if not audio_path.exists():
+
+        raise HTTPException(
+            status_code=404,
+            detail="Audio file not found"
+        )
+
+    return FileResponse(
+        audio_path,
+        media_type="audio/mpeg"
     )

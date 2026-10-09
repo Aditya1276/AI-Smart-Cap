@@ -1,9 +1,8 @@
 ﻿fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 python-dotenv
 google-genai
-pydantic
-pillow
-opencv-python
 edge-tts
+miniaudio
+lameenc
